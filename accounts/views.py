@@ -6,6 +6,10 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
+from django.utils.encoding import force_str
+from django.utils.http import urlsafe_base64_decode
+from .tokens import email_verification_token
+from .utils  import envoyer_email_verification
 
 from .serializers import (
     CustomTokenObtainPairSerializer,
@@ -88,27 +92,6 @@ class LogoutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-class RegisterView(generics.CreateAPIView):
-    queryset = User.objects.all()
-    permission_classes = (AllowAny,)
-    serializer_class = RegisterSerializer
-
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-
-        # Génère les tokens directement après l'inscription
-        refresh = RefreshToken.for_user(user)
-        return Response({
-            'success': True,
-            'message': "Compte créé avec succès.",
-            'data': {
-                'user':    UserProfileSerializer(user).data,
-                'refresh': str(refresh),
-                'access':  str(refresh.access_token),
-            }
-        }, status=status.HTTP_201_CREATED)
 
 class ProfileView(generics.RetrieveUpdateAPIView):
     permission_classes = (IsAuthenticated,)
@@ -143,4 +126,112 @@ class ChangePasswordView(APIView):
         return Response(
             {'success': False, 'errors': serializer.errors},
             status=status.HTTP_400_BAD_REQUEST
+        )
+
+# Inscription
+class RegisterView(generics.CreateAPIView):
+    queryset = User.objects.all()
+    permission_classes = (AllowAny,)
+    serializer_class = RegisterSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        # Envoi de l'email de vérification
+        try:
+            envoyer_email_verification(user, request)
+        except Exception as e:
+            # On ne bloque pas l'inscription si l'email échoue
+            user.delete()
+            return Response({
+                'success': False,
+                'message': f"Erreur lors de l'envoi de l'email : {str(e)}"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({
+            'success': True,
+            'message': "Compte créé. Vérifiez votre email pour activer votre compte.",
+            'data': {
+                'email': user.email,
+            }
+        }, status=status.HTTP_201_CREATED)
+
+
+# Vérification email
+class VerifyEmailView(APIView):
+    permission_classes = (AllowAny,)
+
+    def get(self, request, uidb64, token):
+        try:
+            uid  = force_str(urlsafe_base64_decode(uidb64))
+            user = User.objects.get(pk=uid)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            return Response(
+                {'success': False, 'message': "Lien invalide."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if user.is_active:
+            return Response(
+                {'success': False, 'message': "Ce compte est déjà activé."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not email_verification_token.check_token(user, token):
+            return Response(
+                {'success': False, 'message': "Lien expiré ou invalide."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Active le compte
+        user.is_active = True
+        user.save()
+
+        # Génère les tokens JWT directement
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'success': True,
+            'message': "Email vérifié. Compte activé avec succès.",
+            'data': {
+                'user':    UserProfileSerializer(user).data,
+                'access':  str(refresh.access_token),
+                'refresh': str(refresh),
+            }
+        }, status=status.HTTP_200_OK)
+
+
+# Renvoi de l'email de vérification 
+class ResendVerificationEmailView(APIView):
+    permission_classes = (AllowAny,)
+
+    def post(self, request):
+        email = request.data.get('email')
+
+        if not email:
+            return Response(
+                {'success': False, 'message': "Email requis."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            # Réponse volontairement identique pour ne pas exposer les emails
+            return Response(
+                {'success': True, 'message': "Si ce compte existe, un email a été envoyé."},
+                status=status.HTTP_200_OK
+            )
+
+        if user.is_active:
+            return Response(
+                {'success': False, 'message': "Ce compte est déjà activé."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        envoyer_email_verification(user, request)
+        return Response(
+            {'success': True, 'message': "Email de vérification renvoyé."},
+            status=status.HTTP_200_OK
         )
